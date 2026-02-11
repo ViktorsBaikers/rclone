@@ -1369,7 +1369,7 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 		return o.hash, nil
 	}
 
-	// Fetch from server if not cached
+	// Fetch from server if not cached.
 	var file api.FileInfo
 	opts := rest.Opts{
 		Method: "GET",
@@ -1380,7 +1380,6 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &file)
 		return shouldRetry(ctx, resp, err)
 	})
-
 	if err != nil {
 		return "", fmt.Errorf("failed to get file hash: %w", err)
 	}
@@ -1390,7 +1389,7 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 		return o.hash, nil
 	}
 
-	return "", hash.ErrUnsupported
+	return "", fmt.Errorf("hash metadata unavailable for %q", o.remote)
 }
 
 // ID returns the ID of the Object if known, or "" if not
