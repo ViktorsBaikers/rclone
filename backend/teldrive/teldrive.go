@@ -81,8 +81,8 @@ func init() {
 		},
 			{
 				Name:     "threaded_streams",
-				Default:  false,
-				Help:     "Thread Streams",
+				Default:  true,
+				Help:     "Allow multi-threaded streams",
 				Advanced: true,
 			},
 			{
@@ -124,6 +124,7 @@ type Options struct {
 	EncryptFiles      bool                 `config:"encrypt_files"`
 	PageSize          int64                `config:"page_size"`
 	HashEnabled       bool                 `config:"hash_enabled"`
+	ThreadedStreams   bool                 `config:"threaded_streams"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -273,6 +274,7 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 		CanHaveEmptyDirectories: true,
 		ReadMimeType:            true,
 		ChunkWriterDoesntSeek:   true,
+		NoMultiThreading:        !f.opt.ThreadedStreams,
 	}).Fill(ctx, f)
 
 	client := fshttp.NewClient(ctx)
@@ -628,7 +630,7 @@ func (f *Fs) updateFileInformation(ctx context.Context, update *api.UpdateFileIn
 	return err
 }
 
-func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.OpenOption) error {
+func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.OpenOption) (*Object, error) {
 	o := &Object{
 		fs: f,
 	}
@@ -642,18 +644,41 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		fs.Debugf(f, "putUnchecked: unknown size, buffering to memory (threshold: %d bytes)", memoryBufferThreshold)
 		uploadInfo, size, err = o.uploadWithBuffering(ctx, in, src)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		// Create new src with known size for createFile
 		src = object.NewStaticObjectInfo(src.Remote(), src.ModTime(ctx), size, false, nil, f)
 	} else {
 		uploadInfo, err = o.uploadMultipart(ctx, in, src)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	return o.createFile(ctx, src, uploadInfo)
+	createdInfo, err := o.createFile(ctx, src, uploadInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	if createdInfo != nil {
+		createdObject, newErr := f.newObjectWithInfo(ctx, src.Remote(), createdInfo)
+		if newErr == nil {
+			typedObject, ok := createdObject.(*Object)
+			if ok {
+				return typedObject, nil
+			}
+		}
+	}
+
+	createdObject, err := f.NewObject(ctx, src.Remote())
+	if err != nil {
+		return nil, err
+	}
+	typedObject, ok := createdObject.(*Object)
+	if !ok {
+		return nil, fmt.Errorf("unexpected object type %T for %s", createdObject, src.Remote())
+	}
+	return typedObject, nil
 }
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
@@ -698,11 +723,11 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // This will create a duplicate if we upload a new file without
 // checking to see if there is one already - use Put() for that.
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	err := f.putUnchecked(ctx, in, src, options...)
+	obj, err := f.putUnchecked(ctx, in, src, options...)
 	if err != nil {
 		return nil, err
 	}
-	return f.NewObject(ctx, src.Remote())
+	return obj, nil
 }
 
 // Update the already existing object

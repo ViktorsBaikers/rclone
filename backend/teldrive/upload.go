@@ -144,7 +144,8 @@ func (w *objectChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, rea
 
 func (w *objectChunkWriter) Close(ctx context.Context) error {
 
-	return w.o.createFile(ctx, w.src, w.uploadInfo)
+	_, err := w.o.createFile(ctx, w.src, w.uploadInfo)
+	return err
 }
 
 func (*objectChunkWriter) Abort(ctx context.Context) error {
@@ -234,7 +235,8 @@ func (w *bufferingChunkWriter) Close(ctx context.Context) error {
 	chunkReader.cleanup()
 	w.chunks = nil
 
-	return w.o.createFile(ctx, src, uploadInfo)
+	_, err = w.o.createFile(ctx, src, uploadInfo)
+	return err
 }
 
 // Abort cleans up temp files
@@ -470,6 +472,7 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo) (*uploadI
 func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.ObjectInfo) (*uploadInfo, error) {
 
 	size := src.Size()
+	readSeeker, hasReadSeeker := in.(io.ReadSeeker)
 
 	uploadInfo, err := o.prepareUpload(ctx, src)
 
@@ -508,11 +511,8 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 				chunkName = fmt.Sprintf("%s.part.%03d", chunkName, chunkNo)
 			}
 
-			partReader := io.LimitReader(in, n)
-
 			opts := rest.Opts{
 				Method:        "POST",
-				Body:          partReader,
 				NoResponse:    true,
 				ContentLength: &n,
 				ContentType:   "application/octet-stream",
@@ -535,9 +535,26 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 			} else {
 				opts.Path = "/api/uploads/" + uploadInfo.uploadID
 			}
-			_, err := o.fs.srv.Call(ctx, &opts)
-			if err != nil {
-				return nil, err
+
+			chunkStart := uploadedSize
+			if hasReadSeeker {
+				err = o.fs.pacer.Call(func() (bool, error) {
+					if _, seekErr := readSeeker.Seek(chunkStart, io.SeekStart); seekErr != nil {
+						return false, seekErr
+					}
+					opts.Body = io.LimitReader(readSeeker, n)
+					resp, callErr := o.fs.srv.Call(ctx, &opts)
+					return shouldRetry(ctx, resp, callErr)
+				})
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				opts.Body = io.LimitReader(in, n)
+				_, err = o.fs.srv.Call(ctx, &opts)
+				if err != nil {
+					return nil, err
+				}
 			}
 			uploadedSize += n
 		}
@@ -547,12 +564,11 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 
 }
 
-func (o *Object) createFile(ctx context.Context, src fs.ObjectInfo, uploadInfo *uploadInfo) error {
+func (o *Object) createFile(ctx context.Context, src fs.ObjectInfo, uploadInfo *uploadInfo) (*api.FileInfo, error) {
 
 	opts := rest.Opts{
-		Method:     "POST",
-		Path:       "/api/files",
-		NoResponse: true,
+		Method: "POST",
+		Path:   "/api/files",
 	}
 
 	payload := api.CreateFileRequest{
@@ -567,14 +583,15 @@ func (o *Object) createFile(ctx context.Context, src fs.ObjectInfo, uploadInfo *
 		ModTime:   src.ModTime(ctx).UTC(),
 	}
 
+	var created api.FileInfo
 	err := o.fs.pacer.Call(func() (bool, error) {
-		resp, err := o.fs.srv.CallJSON(ctx, &opts, &payload, nil)
+		resp, err := o.fs.srv.CallJSON(ctx, &opts, &payload, &created)
 		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return &created, nil
 }
