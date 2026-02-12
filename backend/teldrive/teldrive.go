@@ -101,6 +101,12 @@ func init() {
 				Help:    "Enable Blake3 Tree Hashing",
 			},
 			{
+				Name:     "upload_resume",
+				Default:  true,
+				Help:     "Check for existing upload parts before uploading. Disable for bulk imports to skip one API call per file.",
+				Advanced: true,
+			},
+			{
 				Name:     config.ConfigEncoding,
 				Help:     config.ConfigEncodingHelp,
 				Advanced: true,
@@ -124,6 +130,7 @@ type Options struct {
 	EncryptFiles      bool                 `config:"encrypt_files"`
 	PageSize          int64                `config:"page_size"`
 	HashEnabled       bool                 `config:"hash_enabled"`
+	UploadResume      bool                 `config:"upload_resume"`
 	ThreadedStreams   bool                 `config:"threaded_streams"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
@@ -354,12 +361,14 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 }
 
 func (f *Fs) readMetaDataForPath(ctx context.Context, path string, options *api.MetadataRequestOptions) (*api.ReadMetadataResponse, error) {
-
 	directoryID, err := f.dirCache.FindDir(ctx, path, false)
-
 	if err != nil {
 		return nil, err
 	}
+	return f.listPage(ctx, directoryID, options)
+}
+
+func (f *Fs) listPage(ctx context.Context, directoryID string, options *api.MetadataRequestOptions) (*api.ReadMetadataResponse, error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/api/files",
@@ -373,6 +382,7 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string, options *api.
 	}
 	var info api.ReadMetadataResponse
 	var resp *http.Response
+	var err error
 
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
@@ -427,7 +437,7 @@ func (f *Fs) getFileShare(ctx context.Context, id string) (*api.FileShare, error
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		if resp.StatusCode == http.StatusNotFound {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return nil, fs.ErrorObjectNotFound
 		}
 		return nil, err
@@ -448,25 +458,27 @@ func (f *Fs) getFileShare(ctx context.Context, id string) (*api.FileShare, error
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return nil, err
+	}
 
 	opts := &api.MetadataRequestOptions{
 		Limit: f.opt.PageSize,
 		Page:  1,
 	}
 
-	files := []api.FileInfo{}
-
-	info, err := f.readMetaDataForPath(ctx, dir, opts)
-
+	info, err := f.listPage(ctx, directoryID, opts)
 	if err != nil {
 		return nil, err
 	}
 
+	files := make([]api.FileInfo, 0, len(info.Files))
 	files = append(files, info.Files...)
-	mu := sync.Mutex{}
-	if info.Meta.TotalPages > 1 {
-		g, _ := errgroup.WithContext(ctx)
 
+	if info.Meta.TotalPages > 1 {
+		mu := sync.Mutex{}
+		g, gCtx := errgroup.WithContext(ctx)
 		g.SetLimit(8)
 
 		for i := 2; i <= info.Meta.TotalPages; i++ {
@@ -476,7 +488,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 					Limit: f.opt.PageSize,
 					Page:  int64(page),
 				}
-				info, err := f.readMetaDataForPath(ctx, dir, opts)
+				info, err := f.listPage(gCtx, directoryID, opts)
 				if err != nil {
 					return err
 				}
@@ -798,26 +810,33 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 // ChangeNotify calls the passed function with a path that has had changes.
 func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case pollInterval, ok := <-pollIntervalChan:
-				if !ok {
-					fs.Debugf(f, "ChangeNotify: channel closed, stopping")
+		sseCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		// Drain poll interval channel — we use SSE, not polling
+		go func() {
+			for {
+				select {
+				case <-sseCtx.Done():
 					return
-				}
-				if pollInterval > 0 {
-					fs.Debugf(f, "ChangeNotify: poll interval set but SSE is active, ignoring")
-				}
-			default:
-				fs.Debugf(f, "Starting SSE event stream")
-				err := f.changeNotifySSE(ctx, notifyFunc)
-				if err != nil {
-					fs.Infof(f, "SSE connection failed permanently: %s", err)
-					return
+				case _, ok := <-pollIntervalChan:
+					if !ok {
+						cancel()
+						return
+					}
 				}
 			}
+		}()
+
+		fs.Debugf(f, "Starting SSE event stream")
+		// changeNotifySSE handles retries internally via ssePacer;
+		// it only returns on fatal error or context cancellation.
+		err := f.changeNotifySSE(sseCtx, notifyFunc)
+		if err != nil {
+			if fserrors.ContextError(sseCtx, &err) {
+				return
+			}
+			fs.Infof(f, "SSE connection failed permanently: %s", err)
 		}
 	}()
 }

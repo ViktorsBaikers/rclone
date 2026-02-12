@@ -3,6 +3,7 @@ package teldrive
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -148,5 +149,87 @@ func TestPutUnchecked_UsesCreateResponseWithoutLookup(t *testing.T) {
 	}
 	if got := getCalls.Load(); got != 0 {
 		t.Fatalf("expected zero lookup requests, got %d", got)
+	}
+}
+
+func TestPrepareUpload_UploadResumeDisabledUsesUniqueUploadID(t *testing.T) {
+	f := &Fs{
+		opt: Options{
+			ChunkSize:    fs.SizeSuffix(5),
+			ChannelID:    42,
+			UploadResume: false,
+		},
+	}
+	f.dirCache = dircache.New("", "root-folder", f)
+	f.rootFolderID = "root-folder"
+	f.userId = 99
+
+	o := &Object{
+		fs:     f,
+		remote: "file.bin",
+	}
+	src := object.NewStaticObjectInfo("file.bin", time.Now(), 12, false, nil, f)
+
+	first, err := o.prepareUpload(context.Background(), src)
+	if err != nil {
+		t.Fatalf("first prepareUpload failed: %v", err)
+	}
+	second, err := o.prepareUpload(context.Background(), src)
+	if err != nil {
+		t.Fatalf("second prepareUpload failed: %v", err)
+	}
+
+	if first.uploadID == second.uploadID {
+		t.Fatalf("expected unique upload IDs with upload_resume disabled, got %q", first.uploadID)
+	}
+
+	deterministicID := getMD5Hash(fmt.Sprintf("%s:%s:%d:%d", "root-folder", "file.bin", src.Size(), f.userId))
+	if first.uploadID == deterministicID || second.uploadID == deterministicID {
+		t.Fatalf("expected non-deterministic upload IDs with upload_resume disabled, got %q and %q", first.uploadID, second.uploadID)
+	}
+}
+
+func TestPrepareUpload_UploadResumeEnabledUsesDeterministicUploadID(t *testing.T) {
+	expectedUploadID := getMD5Hash(fmt.Sprintf("%s:%s:%d:%d", "root-folder", "file.bin", int64(12), int64(99)))
+	var getCalls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/uploads/"+expectedUploadID {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		getCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt: Options{
+			ChunkSize:    fs.SizeSuffix(5),
+			ChannelID:    42,
+			UploadResume: true,
+		},
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+	}
+	f.dirCache = dircache.New("", "root-folder", f)
+	f.rootFolderID = "root-folder"
+	f.userId = 99
+
+	o := &Object{
+		fs:     f,
+		remote: "file.bin",
+	}
+	src := object.NewStaticObjectInfo("file.bin", time.Now(), 12, false, nil, f)
+
+	info, err := o.prepareUpload(context.Background(), src)
+	if err != nil {
+		t.Fatalf("prepareUpload failed: %v", err)
+	}
+	if info.uploadID != expectedUploadID {
+		t.Fatalf("expected deterministic upload ID %q, got %q", expectedUploadID, info.uploadID)
+	}
+	if got := getCalls.Load(); got != 1 {
+		t.Fatalf("expected one upload parts lookup, got %d", got)
 	}
 }

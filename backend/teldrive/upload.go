@@ -413,6 +413,10 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo) (*uploadI
 	}
 
 	uploadID := getMD5Hash(fmt.Sprintf("%s:%s:%d:%d", directoryID, leaf, src.Size(), o.fs.userId))
+	if !o.fs.opt.UploadResume {
+		// Without resume enabled, avoid reusing stale server-side parts from prior attempts.
+		uploadID = getMD5Hash(uuid.New().String())
+	}
 
 	var (
 		uploadParts    []api.PartFile
@@ -426,7 +430,7 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo) (*uploadI
 
 	chunkSize := int64(o.fs.opt.ChunkSize)
 
-	if chunkSize < src.Size() {
+	if chunkSize < src.Size() && o.fs.opt.UploadResume {
 		err := o.fs.pacer.Call(func() (bool, error) {
 			resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &uploadParts)
 			return shouldRetry(ctx, resp, err)
@@ -550,8 +554,15 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 					return nil, err
 				}
 			} else {
-				opts.Body = io.LimitReader(in, n)
-				_, err = o.fs.srv.Call(ctx, &opts)
+				buf := new(bytes.Buffer)
+				if _, copyErr := io.Copy(buf, io.LimitReader(in, n)); copyErr != nil {
+					return nil, copyErr
+				}
+				err = o.fs.pacer.Call(func() (bool, error) {
+					opts.Body = bytes.NewReader(buf.Bytes())
+					resp, callErr := o.fs.srv.Call(ctx, &opts)
+					return shouldRetry(ctx, resp, callErr)
+				})
 				if err != nil {
 					return nil, err
 				}
