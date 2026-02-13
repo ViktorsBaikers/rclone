@@ -266,7 +266,10 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 		name:  name,
 		root:  root,
 		opt:   *opt,
-		pacer: fs.NewPacer(ctx, pacer.NewDefault()),
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(
+			pacer.MinSleep(1*time.Millisecond),
+			pacer.MaxSleep(1*time.Second),
+		)),
 		// Dedicated SSE pacer with optimized settings for connection retries
 		ssePacer: fs.NewPacer(ctx, pacer.NewDefault(
 			pacer.MinSleep(1*time.Second),
