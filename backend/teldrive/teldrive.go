@@ -13,7 +13,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/rclone/rclone/backend/teldrive/api"
@@ -30,7 +29,6 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -263,9 +261,9 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 	}
 
 	f := &Fs{
-		name:  name,
-		root:  root,
-		opt:   *opt,
+		name: name,
+		root: root,
+		opt:  *opt,
 		pacer: fs.NewPacer(ctx, pacer.NewDefault(
 			pacer.MinSleep(1*time.Millisecond),
 			pacer.MaxSleep(1*time.Second),
@@ -379,8 +377,10 @@ func (f *Fs) listPage(ctx context.Context, directoryID string, options *api.Meta
 			"parentId":  []string{directoryID},
 			"limit":     []string{strconv.FormatInt(options.Limit, 10)},
 			"sort":      []string{"id"},
+			"order":     []string{"asc"},
 			"operation": []string{"list"},
 			"page":      []string{strconv.FormatInt(options.Page, 10)},
+			"cursor":    []string{options.Cursor},
 		},
 	}
 	var info api.ReadMetadataResponse
@@ -466,62 +466,39 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, err
 	}
 
-	opts := &api.MetadataRequestOptions{
-		Limit: f.opt.PageSize,
-		Page:  1,
-	}
+	opts := &api.MetadataRequestOptions{Limit: f.opt.PageSize, Page: 1, Cursor: ""}
 
-	info, err := f.listPage(ctx, directoryID, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	files := make([]api.FileInfo, 0, len(info.Files))
-	files = append(files, info.Files...)
-
-	if info.Meta.TotalPages > 1 {
-		mu := sync.Mutex{}
-		g, gCtx := errgroup.WithContext(ctx)
-		g.SetLimit(8)
-
-		for i := 2; i <= info.Meta.TotalPages; i++ {
-			page := i
-			g.Go(func() error {
-				opts := &api.MetadataRequestOptions{
-					Limit: f.opt.PageSize,
-					Page:  int64(page),
-				}
-				info, err := f.listPage(gCtx, directoryID, opts)
-				if err != nil {
-					return err
-				}
-				mu.Lock()
-				files = append(files, info.Files...)
-				mu.Unlock()
-				return nil
-			})
-		}
-		if err := g.Wait(); err != nil {
+	for {
+		info, err := f.listPage(ctx, directoryID, opts)
+		if err != nil {
 			return nil, err
 		}
-	}
 
-	for _, item := range files {
-		remote := path.Join(dir, f.opt.Enc.ToStandardName(item.Name))
-		if item.Type == "folder" {
-			f.dirCache.Put(remote, item.Id)
-			d := fs.NewDir(remote, item.ModTime).SetID(item.Id).SetParentID(item.ParentId).
-				SetSize(item.Size)
-			entries = append(entries, d)
-		}
-		if item.Type == "file" {
-			o, err := f.newObjectWithInfo(ctx, remote, &item)
-			if err != nil {
-				continue
+		for _, item := range info.Files {
+			remote := path.Join(dir, f.opt.Enc.ToStandardName(item.Name))
+			if item.Type == "folder" {
+				f.dirCache.Put(remote, item.Id)
+				d := fs.NewDir(remote, item.ModTime).SetID(item.Id).SetParentID(item.ParentId).
+					SetSize(item.Size)
+				entries = append(entries, d)
 			}
-			entries = append(entries, o)
+			if item.Type == "file" {
+				o, err := f.newObjectWithInfo(ctx, remote, &item)
+				if err != nil {
+					continue
+				}
+				entries = append(entries, o)
+			}
 		}
 
+		if int64(len(info.Files)) < opts.Limit {
+			break
+		}
+		if len(info.Files) == 0 {
+			break
+		}
+		opts.Cursor = info.Files[len(info.Files)-1].Id
+		opts.Page++
 	}
 	return entries, nil
 }

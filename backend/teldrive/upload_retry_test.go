@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,11 +13,20 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
+
+type nonSeekableReadSeeker struct {
+	*bytes.Reader
+}
+
+func (r *nonSeekableReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	return 0, fmt.Errorf("seek not supported")
+}
 
 func TestUploadMultipart_RetriesChunkOnTransientFailure(t *testing.T) {
 	var postCalls atomic.Int32
@@ -64,6 +74,111 @@ func TestUploadMultipart_RetriesChunkOnTransientFailure(t *testing.T) {
 	}
 	if got := postCalls.Load(); got != 2 {
 		t.Fatalf("expected 2 POST attempts (retry), got %d", got)
+	}
+}
+
+func TestUploadMultipart_ReadSeekerWithoutSeekFallsBackToStreaming(t *testing.T) {
+	var postCalls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/api/uploads/") {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+
+		if got := r.ContentLength; got != int64(len("payload-for-fallback-test")) {
+			t.Fatalf("unexpected content length: got %d", got)
+		}
+
+		postCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	payload := []byte("payload-for-fallback-test")
+
+	f := &Fs{
+		opt: Options{
+			ChunkSize:       fs.SizeSuffix(64 << 20),
+			ChannelID:       42,
+			RandomChunkName: false,
+		},
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+	}
+	f.dirCache = dircache.New("", "root-folder", f)
+	f.rootFolderID = "root-folder"
+	f.userId = 99
+
+	o := &Object{
+		fs:     f,
+		remote: "file.bin",
+	}
+	src := object.NewStaticObjectInfo("file.bin", time.Now(), int64(len(payload)), false, nil, f)
+
+	reader := &nonSeekableReadSeeker{Reader: bytes.NewReader(payload)}
+	uploadInfo, err := o.uploadMultipart(context.Background(), reader, src)
+	if err != nil {
+		t.Fatalf("uploadMultipart failed: %v", err)
+	}
+	if uploadInfo == nil {
+		t.Fatalf("expected upload info, got nil")
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 POST attempt, got %d", got)
+	}
+}
+
+func TestUploadMultipart_AccountSeekNotImplementedFallsBackToStreaming(t *testing.T) {
+	var postCalls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/api/uploads/") {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		postCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	payload := []byte("payload-for-account-async-reader-test")
+
+	f := &Fs{
+		opt: Options{
+			ChunkSize:       fs.SizeSuffix(64 << 20),
+			ChannelID:       42,
+			RandomChunkName: false,
+		},
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+	}
+	f.dirCache = dircache.New("", "root-folder", f)
+	f.rootFolderID = "root-folder"
+	f.userId = 99
+
+	o := &Object{
+		fs:     f,
+		remote: "file.bin",
+	}
+	src := object.NewStaticObjectInfo("file.bin", time.Now(), int64(len(payload)), false, nil, f)
+
+	stats := accounting.NewStats(context.Background())
+	tr := stats.NewTransferRemoteSize("file.bin", -1, nil, nil)
+	t.Cleanup(func() { tr.Done(context.Background(), nil) })
+
+	acc := tr.Account(context.Background(), io.NopCloser(bytes.NewReader(payload))).WithBuffer()
+	if !acc.HasBuffer() {
+		t.Fatalf("expected async buffer to be enabled for test")
+	}
+
+	uploadInfo, err := o.uploadMultipart(context.Background(), acc, src)
+	if err != nil {
+		t.Fatalf("uploadMultipart failed: %v", err)
+	}
+	if uploadInfo == nil {
+		t.Fatalf("expected upload info, got nil")
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 POST attempt, got %d", got)
 	}
 }
 

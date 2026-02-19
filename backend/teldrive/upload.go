@@ -477,6 +477,11 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 
 	size := src.Size()
 	readSeeker, hasReadSeeker := in.(io.ReadSeeker)
+	if size > 0 && hasReadSeeker {
+		if _, err := readSeeker.Seek(0, io.SeekStart); err != nil {
+			hasReadSeeker = false
+		}
+	}
 
 	uploadInfo, err := o.prepareUpload(ctx, src)
 

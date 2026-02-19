@@ -48,8 +48,9 @@ type ReadMetadataResponse struct {
 }
 
 type MetadataRequestOptions struct {
-	Page  int64
-	Limit int64
+	Page   int64
+	Limit  int64
+	Cursor string
 }
 
 type CreateDirRequest struct {
